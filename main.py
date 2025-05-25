@@ -1,212 +1,166 @@
-# main.py
-"""
-Main entry point for the Face Recognition Customer Management System.
-Handles video capture, face recognition, customer analytics, and natural language database queries.
-Follows PEP 8 and professional Pythonic style.
-"""
-
-import mysql.connector
 import cv2
-import dlib
-import face_recognition_models
 import face_recognition
 import numpy as np
 import uuid
 import datetime
 from cachetools import TTLCache
 import faiss
-from utils import handle_question
-from utils import (
-    generate_visit_history_report,
-    plot_visit_analytics,
-    export_customers_to_excel,
-)
-from config import DB_CONFIG
+from config import PREDICTOR_PATH
+from database import fetch_all_customers_for_rec, insert_customer, update_customer_visit
+import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-# Database functions
-def create_connection():
-    return mysql.connector.connect(**DB_CONFIG)
-
-
-def insert_customer(
-    conn, unique_id, name, email, face_encoding, last_visited, visit_count
-):
-    cursor = conn.cursor()
-    query = """INSERT INTO customers (unique_id, name, email, face_encoding, last_visited, visit_count) VALUES (%s, %s, %s, %s, %s, %s)"""
-    cursor.execute(
-        query, (unique_id, name, email, face_encoding, last_visited, visit_count)
-    )
-    conn.commit()
-
-
-def update_customer_visit(conn, customer_id):
-    cursor = conn.cursor()
-    query = """UPDATE customers SET last_visited = NOW(), visit_count = visit_count + 1 WHERE unique_id = %s"""
-    cursor.execute(query, (str(customer_id),))
-    conn.commit()
-
-
-def fetch_customers(conn):
-    cursor = conn.cursor()
-    query = """SELECT * FROM customers"""
-    cursor.execute(query)
-    return cursor.fetchall()
-
-
-conn = create_connection()
-
-
-def is_existing_customer(face_encoding, customers):
-    for customer in customers:
-        db_encoding = np.frombuffer(customer[4], dtype=np.float64)
-        if face_recognition.compare_faces([db_encoding], face_encoding, tolerance=0.6)[
-            0
-        ]:
-            return True, customer
-    return False, None
-
-
-def save_new_customer(face_encoding):
-    unique_id = str(uuid.uuid4())  # Generate a unique ID
-    name = None  # No longer ask for name
-    email = None  # No longer ask for email
-    encoding_blob = face_encoding.tobytes()
-    last_visited = datetime.datetime.now()  # Set to current time
-    visit_count = 1
-    insert_customer(
-        conn, unique_id, name, email, encoding_blob, last_visited, visit_count
-    )
-    return unique_id, name, email
-
-
+# --- FAISS functions ---
 def build_faiss_index(customers):
     if not customers:
         return None, []
-    X = np.array(
-        [np.frombuffer(customer[4], dtype=np.float64) for customer in customers]
-    ).astype("float32")
+    valid_customers = [c for c in customers if c.get("face_encoding")]
+    if not valid_customers:
+        return None, []
+
+    encodings_list = [
+        np.frombuffer(c["face_encoding"], dtype=np.float64) for c in valid_customers
+    ]
+
+    # Ensure all encodings have the same dimension (128)
+    X_list = [enc for enc in encodings_list if enc.shape == (128,)]
+    if not X_list:
+        return None, []
+
+    X = np.array(X_list).astype("float32")
+
+    if X.shape[0] == 0:
+        return None, []
+
     index = faiss.IndexFlatL2(X.shape[1])
     index.add(X)
-    return index, [customer[1] for customer in customers]  # [unique_id, ...]
+    # Map index back to customer unique_id for *valid* encodings
+    id_list = [
+        c["unique_id"]
+        for c, enc in zip(valid_customers, encodings_list)
+        if enc.shape == (128,)
+    ]
+    return index, id_list
 
 
 def search_faiss_index(index, id_list, face_encoding, threshold=0.6):
-    if index is None or len(id_list) == 0:
-        return False, None
-    face_encoding = np.array(face_encoding).astype("float32").reshape(1, -1)
-    D, I = index.search(face_encoding, 1)
-    if D[0][0] < threshold:
-        return True, id_list[I[0][0]]
-    return False, None
+    if index is None or not id_list:
+        return None
+    face_encoding_np = np.array(face_encoding).astype("float32").reshape(1, -1)
+    D, I = index.search(face_encoding_np, 1)
+    if D.size > 0 and I.size > 0 and D[0][0] < threshold:
+        idx = I[0][0]
+        if 0 <= idx < len(id_list):
+            return id_list[idx]
+    return None
 
 
-# Fetch existing customers and build FAISS index
-customers = fetch_customers(conn)
-faiss_index, id_list = build_faiss_index(customers)
+# --- Face Recognition Core ---
+class FaceProcessor:
+    def __init__(self):
+        if not os.path.exists(PREDICTOR_PATH):
+            logger.error(f"Predictor file not found: {PREDICTOR_PATH}")
+            raise FileNotFoundError(f"Predictor file not found: {PREDICTOR_PATH}")
+        self.customers = []
+        self.faiss_index = None
+        self.id_list = []
+        self.known_encodings = []
+        self.known_ids = []
+        self.cache = TTLCache(maxsize=500, ttl=3600)  # 1 hour cache
+        self.refresh_data()
 
-# Set up a cache with a max size and a TTL (in seconds)
-# Example: max 1000 customers, 1 hour TTL (3600 seconds)
-customer_cache = TTLCache(maxsize=1000, ttl=3600)
+    def refresh_data(self):
+        logger.info("Refreshing customer data for face recognition...")
+        try:
+            self.customers = fetch_all_customers_for_rec()
+            if not self.customers:
+                logger.warning("No customers found in DB or no encodings available.")
+                self.customers = []
+                self.faiss_index, self.id_list = None, []
+                self.known_encodings, self.known_ids = [], []
+                return
 
-# Initialize dlib's face detector and facial landmark predictor
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor("shape_predictor_68_face_landmarks.dat")
+            self.faiss_index, self.id_list = build_faiss_index(self.customers)
 
-# Initialize the video stream
-cap = cv2.VideoCapture(0)
+            valid_customers = [c for c in self.customers if c.get("face_encoding")]
+            encodings_list = [
+                np.frombuffer(c["face_encoding"], dtype=np.float64)
+                for c in valid_customers
+            ]
 
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        break
+            self.known_encodings = [
+                enc for enc in encodings_list if enc.shape == (128,)
+            ]
+            self.known_ids = [
+                c["unique_id"]
+                for c, enc in zip(valid_customers, encodings_list)
+                if enc.shape == (128,)
+            ]
 
-    # Convert frame to RGB (face_recognition uses RGB format)
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            logger.info(f"Data refreshed. {len(self.known_ids)} known faces loaded.")
+        except Exception as e:
+            logger.error(f"Error refreshing face recognition data: {e}")
 
-    # Detect faces
-    face_locations = face_recognition.face_locations(rgb_frame)
+    def process_frame(self, frame):
+        """Processes a single frame for faces and identifies/adds customers."""
+        if not self.known_ids:
+            logger.warning(
+                "No known faces loaded, attempting refresh before processing."
+            )
+            self.refresh_data()
+            if not self.known_ids:
+                logger.warning("Still no known faces after refresh, skipping frame.")
+                return []
 
-    for face_location in face_locations:
-        # Get the facial encoding
-        face_encoding = face_recognition.face_encodings(rgb_frame, [face_location])[0]
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # Use a smaller frame for faster detection (optional)
+        # small_frame = cv2.resize(rgb_frame, (0, 0), fx=0.5, fy=0.5)
+        face_locations = face_recognition.face_locations(rgb_frame)
+        face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
 
-        # Use FAISS for fast matching
-        is_existing_faiss, customer_id = search_faiss_index(
-            faiss_index, id_list, face_encoding, threshold=0.6
-        )
+        results = []
 
-        if is_existing_faiss:
-            # Find the customer record by unique_id
-            customer = next((c for c in customers if c[1] == customer_id), None)
-            customer_name = customer[2] if customer else None
-            # Double check with face_recognition
-            if customer:
-                db_encoding = np.frombuffer(customer[4], dtype=np.float64)
-                if face_recognition.compare_faces(
-                    [db_encoding], face_encoding, tolerance=0.6
-                )[0]:
-                    if customer_id in customer_cache:
-                        print(
-                            f"Customer {customer_id} is in cache, skipping DB update."
-                        )
-                    else:
-                        print(
-                            f"Existing customer detected by FAISS and confirmed by face_recognition. Customer ID: {customer_id}, Name: {customer_name}"
-                        )
-                        update_customer_visit(conn, customer_id)
-                        customer_cache[customer_id] = True
-                else:
-                    print(
-                        "FAISS match, but face_recognition did not confirm. Treating as new customer."
-                    )
-                    unique_id, name, email = save_new_customer(face_encoding)
-                    customer_cache[unique_id] = True
-                    customers = fetch_customers(conn)
-                    faiss_index, id_list = build_faiss_index(customers)
-            else:
-                print(
-                    "FAISS found a customer_id, but no matching record in DB. Skipping."
+        for encoding in face_encodings:
+            customer_id = None
+            is_new = False
+
+            # 1. Try FAISS
+            faiss_id = search_faiss_index(self.faiss_index, self.id_list, encoding)
+
+            if faiss_id:
+                customer_id = faiss_id
+            elif self.known_encodings:  # Only search if known_encodings exist
+                # 2. Try face_recognition.compare_faces
+                matches = face_recognition.compare_faces(
+                    self.known_encodings, encoding, tolerance=0.6
                 )
-        else:
-            # Use face_recognition.compare_faces for final check
-            is_existing, customer = is_existing_customer(face_encoding, customers)
-            if is_existing:
-                customer_id = customer[1]
-                customer_name = customer[2]
-                if customer_id in customer_cache:
-                    print(f"Customer {customer_id} is in cache, skipping DB update.")
-                else:
-                    print(
-                        f"Existing customer detected by face_recognition. Customer ID: {customer_id}, Name: {customer_name}"
-                    )
-                    update_customer_visit(conn, customer_id)
-                    customer_cache[customer_id] = True
-            else:
-                print("New customer detected. Saving to database.")
-                unique_id, name, email = save_new_customer(face_encoding)
-                customer_cache[unique_id] = True
-                customers = fetch_customers(conn)
-                faiss_index, id_list = build_faiss_index(customers)
+                if True in matches:
+                    first_match_index = matches.index(True)
+                    customer_id = self.known_ids[first_match_index]
 
-    cv2.imshow("Frame", frame)
+            # 3. If still no match, it's a new customer
+            if not customer_id:
+                unique_id = str(uuid.uuid4())
+                encoding_blob = encoding.tobytes()
+                insert_customer(
+                    unique_id, None, None, encoding_blob, datetime.datetime.now(), 1
+                )
+                logger.info(f"New customer detected: {unique_id}")
+                customer_id = unique_id
+                is_new = True
+                self.refresh_data()  # Refresh data immediately after adding
 
-    if cv2.waitKey(1) & 0xFF == ord("q"):
-        break
+            # 4. Update visit / Cache Check
+            if customer_id and customer_id not in self.cache:
+                if not is_new:
+                    logger.info(f"Existing customer seen: {customer_id}")
+                    update_customer_visit(customer_id)
+                self.cache[customer_id] = True
+                results.append({"customer_id": customer_id, "new": is_new})
+            elif customer_id:
+                logger.debug(f"Customer in cache: {customer_id}")
 
-# Release video resources and close OpenCV windows
-cap.release()
-cv2.destroyAllWindows()
-
-# Generate reports and analytics
-generate_visit_history_report(conn)
-plot_visit_analytics(conn)
-export_customers_to_excel(conn)
-
-# Example: handle a natural language question
-user_input = "what pattern did you understand this whole db data from this database?"
-summary = handle_question(user_input)
-print(f"\nLLM Summary: {summary}")
-
-# Close the database connection
-conn.close()
+        return results

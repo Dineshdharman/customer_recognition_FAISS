@@ -1,45 +1,86 @@
 import os
 import re
-import pymysql
-import sqlparse
-import pandas as pd
+import uuid
+import json
 import matplotlib.pyplot as plt
-from langchain.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 from langchain.prompts import PromptTemplate
-from config import DB_CONFIG, API_KEY
+from config import API_KEY, PLOT_DIR
+from database import fetch_schema, run_query
+import logging
+
+logger = logging.getLogger(__name__)
+
+plt.switch_backend("Agg")
 
 
-# Prompt templates
+# --- LLM Setup ---
+def get_llm():
+    if not API_KEY or API_KEY.startswith("sk-or-v1-3f5485"):
+        logger.warning("[Warning] Using a placeholder/invalid API Key.")
+        return None
+    return ChatOpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=API_KEY,
+        model="deepseek/deepseek-chat",  # "anthropic/claude-3-haiku",
+        temperature=0.1,
+    )
+
+
+# --- Prompts ---
+ROUTER_PROMPT = PromptTemplate.from_template(
+    """
+    You are a classification assistant. Your job is to determine if a user's question
+    is a 'greeting' (like hi, hello, how are you, who are you), a 'goodbye' (like bye, see you),
+    or a 'database_query' (asking for data, counts, trends, plots, customers, visits).
+    User Question: {question}
+    Output ONLY 'greeting', 'goodbye', or 'database_query'.
+    """
+)
+
+GREETING_PROMPT = PromptTemplate.from_template(
+    """
+    You are 'FaceTrack AI', a helpful assistant for the Face Recognition Customer Management System.
+    The user said: {question}.
+    Respond with a friendly greeting (1-2 sentences). Briefly mention your capabilities: I can answer questions about customer data, generate plots, and help you manage your face recognition system.
+    """
+)
+
+GOODBYE_PROMPT = PromptTemplate.from_template(
+    """
+    You are 'FaceTrack AI'. The user said: {question}. Respond with a brief, friendly goodbye.
+    """
+)
+
 SQL_PROMPT = PromptTemplate.from_template(
     """
-    You are an expert SQL assistant. Given the schema:
-    {schema}
-
-    And the user question:
-    {question}
-
-    Write a VALID MySQL query to answer the question.
-    Only output the SQL query, no explanation.
+    You are an expert SQL assistant. Given the schema: {schema}
+    And the user question: {question}
+    Write a VALID MySQL query. Only output the SQL query. Do not add ```sql or explanations.
+    If the question is about 'today', use CURDATE().
+    If asking for 'top' customers, use ORDER BY visit_count DESC.
     """
 )
 
 SUMMARY_PROMPT = PromptTemplate.from_template(
     """
-    Given the SQL result:
-    {result}
-
-    Write a short, human-friendly summary of the insight or pattern it shows.
+    Given the SQL result: {result}. Write a short (1-3 sentences), human-friendly summary.
+    If the result is empty, say 'No data found for that query.'
     """
 )
 
 VISUALIZATION_PROMPT = PromptTemplate.from_template(
     """
-    You are a Python expert who writes matplotlib code for data visualization.
-    Given the SQL query result data as a Python list of tuples:
-    {result}
-
-    Write a complete python code snippet to plot an appropriate chart (bar, line, pie, etc.) that visually represents the data.
-    Make sure to include import statements and plt.show().
+    You are a data visualization advisor. Given a user question '{question}'
+    and SQL results (list of tuples): {result}.
+    The available plot types are 'bar', 'line', 'pie'.
+    Decide the BEST plot type. If unsure, 'bar' is a safe default.
+    Identify the column index for the X-axis (labels) and the Y-axis (values).
+    For pie charts, use Y-axis for values and X-axis for labels.
+    If only one column exists (e.g., COUNT(*)), use it for Y and generate simple labels.
+    Suggest a suitable title.
+    Output ONLY a JSON object: {{"plot_type": "bar", "x_index": 0, "y_index": 1, "title": "Your Title"}}
+    If no visualization seems appropriate from the data, or if the data is empty, output ONLY {{"plot_type": "none"}}.
     """
 )
 
@@ -48,223 +89,154 @@ VISUALIZATION_KEYWORDS = [
     "graph",
     "visualize",
     "chart",
-    "bar chart",
-    "line chart",
-    "drawing",
-    "painting",
-    "diagram",
-    "sketch",
-    "illustration",
-    "figure",
-    "display",
     "show me",
     "draw",
     "picture",
-    "plotting",
     "visual",
-    "bar graph",
-    "histogram",
-    "pie chart",
 ]
 
-def fetch_all_customers(conn):
-    cursor = conn.cursor()
-    query = (
-        """SELECT unique_id, name, email, last_visited, visit_count FROM customers"""
-    )
-    cursor.execute(query)
-    rows = cursor.fetchall()
-    columns = [desc[0] for desc in cursor.description]
-    df = pd.DataFrame(rows, columns=columns)
-    return df
 
-def generate_visit_history_report(conn, output_csv="visit_history_report.csv"):
-    df = fetch_all_customers(conn)
-    df.to_csv(output_csv, index=False)
-    print(f"Customer visit history exported to {output_csv}")
-    return df
-
-
-def plot_visit_analytics(conn):
-    df = fetch_all_customers(conn)
-    if df.empty:
-        print("No customer data available for analytics.")
-        return
-    # Plot: Most frequent visitors
-    top_visitors = df.sort_values("visit_count", ascending=False).head(10)
-    plt.figure(figsize=(10, 6))
-    plt.bar(top_visitors["unique_id"], top_visitors["visit_count"])
-    plt.xlabel("Customer ID")
-    plt.ylabel("Visit Count")
-    plt.title("Top 10 Most Frequent Visitors")
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-    # Plot: Visits over time (if last_visited is not null)
-    if df["last_visited"].notnull().any():
-        df["last_visited"] = pd.to_datetime(df["last_visited"], errors="coerce")
-        df = df.dropna(subset=["last_visited"])
-        df["date"] = df["last_visited"].dt.date
-        visits_per_day = df.groupby("date").size()
-        plt.figure(figsize=(10, 6))
-        visits_per_day.plot(kind="bar")
-        plt.xlabel("Date")
-        plt.ylabel("Number of Visits")
-        plt.title("Visits Per Day")
-        plt.tight_layout()
-        plt.show()
-    else:
-        print("No last_visited data to plot visits over time.")
-
-
-def export_customers_to_excel(conn, output_excel="customers_export.xlsx"):
-    df = fetch_all_customers(conn)
-    df.to_excel(output_excel, index=False)
-    print(f"Customer data exported to {output_excel}")
-
-def fetch_schema(cursor):
-    """Fetch the schema of all tables in the database."""
-    cursor.execute("SHOW TABLES")
-    tables = cursor.fetchall()
-    schema = ""
-    for (table,) in tables:
-        cursor.execute(f"SHOW COLUMNS FROM {table}")
-        cols = cursor.fetchall()
-        schema += f"\nTable `{table}`:\n"
-        for col in cols:
-            schema += f"  - {col[0]} ({col[1]})\n"
-    return schema
-
-
-def is_valid_sql(query):
-    """Check if the SQL query is valid using sqlparse."""
-    try:
-        parsed = sqlparse.parse(query)
-        return len(parsed) > 0
-    except Exception:
-        return False
-
-
-def run_query(query):
-    """Run a SQL query and return the results."""
-    connection = pymysql.connect(**DB_CONFIG)
-    with connection.cursor() as cursor:
-        cursor.execute(query)
-        results = cursor.fetchall()
-    connection.close()
-    return results
-
-
+# --- SQL & Summary ---
 def clean_sql_output(response):
-    """Clean LLM output to extract the SQL query only."""
     cleaned = re.sub(r"^```sql|```$", "", response.strip(), flags=re.IGNORECASE).strip()
     if cleaned.lower().startswith("sql"):
         cleaned = cleaned[3:].strip()
     return cleaned
 
 
-def generate_sql(question, schema, llm=None):
-    """Generate a SQL query from a user question and schema using LLM."""
-    if llm is None:
-        llm = ChatOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            openai_api_key=API_KEY,
-            model="deepseek/deepseek-chat",
-        )
+def generate_sql(question, schema):
+    llm = get_llm()
+    if not llm:
+        return "SELECT 'API Key Missing';"
     prompt = SQL_PROMPT.format(question=question, schema=schema)
-    response = llm.predict(prompt)
-    sql_query = clean_sql_output(response)
-    return sql_query
+    response = llm.invoke(prompt).content
+    return clean_sql_output(response)
 
 
-def summarize_result(results, llm=None):
-    """Summarize SQL results using LLM."""
-    if llm is None:
-        llm = ChatOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            openai_api_key=API_KEY,
-            model="deepseek/deepseek-chat",
-        )
-    result_text = str(results)
-    prompt = SUMMARY_PROMPT.format(result=result_text)
+def summarize_result(results):
+    llm = get_llm()
+    if not llm:
+        return "Summary unavailable (API Key Missing)."
+    if not results:
+        return "No data found for that query."
+    prompt = SUMMARY_PROMPT.format(result=str(results))
+    return llm.invoke(prompt).content
+
+
+# --- Plotting ---
+def get_visualization_advice(question, results):
+    llm = get_llm()
+    if not llm or not results:
+        return None
+    prompt = VISUALIZATION_PROMPT.format(question=question, result=str(results))
+    response = llm.invoke(prompt).content
+    logger.debug(f"LLM Viz Advice Raw: {response}")
     try:
-        response = llm.predict(prompt)
-        return response
+        match = re.search(r"\{.*\}", response, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        else:
+            logger.warning("Could not extract JSON from LLM viz advice.")
+            return None
+    except json.JSONDecodeError as e:
+        logger.error(f"Error decoding LLM viz advice: {e} - Response: {response}")
+        return None
+
+
+def generate_safe_plot(results, plot_info):
+    if not results or not plot_info:
+        return None
+    try:
+        plot_type = plot_info.get("plot_type", "bar")
+        x_index = int(plot_info.get("x_index", 0))
+        y_index = int(plot_info.get("y_index", 1))
+        title = plot_info.get("title", "Generated Plot")
+
+        if (
+            not results
+            or not results[0]
+            or x_index >= len(results[0])
+            or y_index >= len(results[0])
+        ):
+            logger.error(f"Invalid column indices {x_index},{y_index} for results.")
+            return None
+
+        labels = [str(row[x_index]) for row in results]
+        values = [
+            float(row[y_index]) if row[y_index] is not None else 0.0 for row in results
+        ]
+
+        plt.figure(figsize=(8, 5))
+
+        if plot_type == "bar":
+            plt.bar(labels, values, color="#4f46e5")
+            plt.xticks(rotation=45, ha="right")
+        elif plot_type == "line":
+            plt.plot(labels, values, marker="o", color="#10b981")
+            plt.xticks(rotation=45, ha="right")
+        elif plot_type == "pie":
+            plt.pie(values, labels=labels, autopct="%1.1f%%", startangle=90)
+            plt.axis("equal")
+        else:
+            plt.bar(labels, values, color="#4f46e5")
+            plt.xticks(rotation=45, ha="right")
+
+        plt.title(title, fontsize=14)
+        plt.tight_layout()
+
+        filename = f"{uuid.uuid4().hex}.png"
+        filepath = os.path.join(PLOT_DIR, filename)
+        plt.savefig(filepath)
+        plt.close()
+        logger.info(f"Plot saved as {filepath}")
+        return filename
     except Exception as e:
-        print(f"[Summary Generation Error]: {e}")
-        return "Summary generation failed."
+        logger.error(f"Error generating safe plot: {e}")
+        return None
 
 
-def extract_code_from_response(response):
-    """Extract python code from LLM response."""
-    code_blocks = re.findall(r"```(?:python)?\n(.*?)```", response, re.DOTALL)
-    if code_blocks:
-        return code_blocks[0].strip()
-    else:
-        lines = response.splitlines()
-        for i, line in enumerate(lines):
-            if line.strip().startswith(("import", "def", "plt", "#")):
-                return "\n".join(lines[i:]).strip()
-        return response.strip()
-
-
-def generate_visualization_code(results, llm=None):
-    """Generate matplotlib code for visualizing SQL results using LLM."""
-    if llm is None:
-        llm = ChatOpenAI(
-            base_url="https://openrouter.ai/api/v1",
-            openai_api_key=API_KEY,
-            model="deepseek/deepseek-chat",
-        )
-    result_text = str(results)
-    prompt = VISUALIZATION_PROMPT.format(result=result_text)
-    response = llm.predict(prompt)
-    code = extract_code_from_response(response)
-    return code
-
-
-def execute_visualization_code(code):
-    """Execute generated matplotlib code and save the plot as output_plot.png."""
-    filename = "temp_visualization.py"
-    with open(filename, "w") as f:
-        f.write(code)
-    # Replace plt.show() with plt.savefig
-    modified_code = code.replace(
-        "plt.show()",
-        'plt.savefig("output_plot.png")\nprint("Plot saved as output_plot.png")',
-    )
-    with open(filename, "w") as f:
-        f.write(modified_code)
-    os.system(f"python {filename}")
-    os.remove(filename)
-
-
+# --- Main Handler ---
 def handle_question(question):
-    """Main entry point: handle a user question, generate SQL, run it, summarize, and visualize if needed."""
-    import pymysql
+    llm = get_llm()
+    if not llm:
+        return "Chatbot is offline (API Key Missing).", None
 
-    connection = pymysql.connect(**DB_CONFIG)
-    with connection.cursor() as cursor:
-        schema = fetch_schema(cursor)
-    want_visual = any(keyword in question.lower() for keyword in VISUALIZATION_KEYWORDS)
-    for _ in range(2):
-        sql_query = generate_sql(question, schema)
-        print(f"[Generated SQL] {sql_query}")
-        if not is_valid_sql(sql_query):
-            print("Invalid SQL syntax. Retrying...")
-            continue
-        try:
+    try:
+        router_prompt_text = ROUTER_PROMPT.format(question=question)
+        route = llm.invoke(router_prompt_text).content.strip().lower()
+        logger.info(f"Chat Route: {route}")
+
+        if "greeting" in route:
+            prompt = GREETING_PROMPT.format(question=question)
+            return llm.invoke(prompt).content, None
+        elif "goodbye" in route:
+            prompt = GOODBYE_PROMPT.format(question=question)
+            return llm.invoke(prompt).content, None
+        elif "database_query" in route:
+            schema = fetch_schema()
+            want_visual = any(
+                keyword in question.lower() for keyword in VISUALIZATION_KEYWORDS
+            )
+            plot_filename = None
+            sql_query = generate_sql(question, schema)
+            logger.info(f"[Generated SQL] {sql_query}")
+
             results = run_query(sql_query)
-            print(f"[SQL Results] {results}")
-            if want_visual and results:
-                print("Generating visualization...")
-                vis_code = generate_visualization_code(results)
-                print(f"[Visualization Code]\n{vis_code}\n")
-                execute_visualization_code(vis_code)
-            print("Generating summary...")
+            logger.info(f"[SQL Results] {results}")
+
             summary = summarize_result(results)
-            return summary
-        except Exception as e:
-            print(f"Error running SQL: {e}")
-            continue
-    return "Sorry, I couldn't process your request."
+
+            if want_visual and results:
+                plot_info = get_visualization_advice(question, results)
+                if plot_info and plot_info.get("plot_type") != "none":
+                    plot_filename = generate_safe_plot(results, plot_info)
+
+            return summary, plot_filename
+        else:
+            return (
+                "I can help with greetings or questions about customer data. How can I assist you?",
+                None,
+            )
+    except Exception as e:
+        logger.error(f"Error handling question '{question}': {e}")
+        return "Sorry, I encountered an error. Please try again or rephrase.", None
